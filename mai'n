@@ -1,0 +1,475 @@
+#define OPENCV_TRAITS_ENABLE_DEPRECATED //to solve an unkonw problem!
+
+#include <opencv2/opencv.hpp>
+#include "opencv2/imgproc.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/highgui.hpp"main
+#include <iostream>
+#include <vector>
+#include <math.h>
+#include <string>
+
+using namespace cv;
+using namespace std;
+using namespace ml;
+
+struct ArmorParam{
+
+    int color_threshold;   //color threshold for colorImg from substract channels 通道相减的colorImg使用的二值化阈值
+    int bright_threshold;  //color threshold for brightImg 亮度图二值化阈值
+
+    float min_area;		// min area of light bar 灯条允许的最小面积
+    float max_angle;	//max angle of light bar 灯条允许的最大偏角
+
+    float max_angle_diff; //max angle difference between two light bars 两个灯条之间允许的最大角度差
+    float max_lengthDiff_ratio; //max length ratio difference between two light bars 两个灯条之间允许的最大长度差比值
+    float max_deviation_angle; //max deviation angle 两灯条最大错位角
+
+    float max_y_diff_ratio;  //max y
+    float max_x_diff_ratio;  //max x
+
+
+    //default values  给各参数设定默认值
+    ArmorParam(){
+    color_threshold = 100-20;
+    bright_threshold = 60;
+
+    min_area = 50;
+    max_angle = 45;
+
+    max_angle_diff = 6;
+    max_lengthDiff_ratio = 0.5;
+    max_deviation_angle = 50;
+
+    max_y_diff_ratio = 0.5;
+    max_x_diff_ratio = 4.5;
+    }
+};
+
+ArmorParam armorParam = ArmorParam();
+
+enum ArmorType
+{
+    SMALL_ARMOR = 0,
+    BIG_ARMOR = 1
+};
+
+const Point2f crossPointof(const Point2f& bl,const Point2f& tl,const Point2f& tr, const Point2f& br){
+    float a1 = tr.y - bl.y;
+    float b1 = tr.x - bl.x;
+    float c1 = bl.x*tr.y - tr.x*bl.y;
+
+    float a2 = br.y - tl.y;
+    float b2 = br.x - tl.x;
+    float c2 = tl.x*br.y - br.x*tl.y;
+
+    float d = a1 * b2 - a2 * b1;
+
+    if (d == 0.0){
+        return Point2f(FLT_MAX, FLT_MAX);
+    }
+    else{
+        return cv::Point2f((b2*c1 - b1 * c2) / d, (c1*a2 - c2 * a1) / d);
+    }
+}
+
+class LightBar
+{
+public:
+
+    LightBar();
+/**
+ *@brief: Parametrical constructor of lightBar 灯条有参构造函数
+ *@param: RotatedRect created by fitellipse  拟合椭圆获得的旋转矩形来构造灯条
+ */
+    LightBar(const RotatedRect& light);
+    ~LightBar(){;};
+
+public:
+    RotatedRect LightRect; //rotation rect of light 灯条的旋转矩形（椭圆拟合获得）
+    float length;  //length of light bar 灯条长度
+    Point2f center; //center of light bar 灯条中心
+    float angle;  //angle of light bar(between length direction and vertical, left 0~90 right 0~-90) 灯条长度方向与竖直方向的夹角，左偏为0~90,右偏为0~-90
+};
+
+
+LightBar::LightBar(){
+    LightRect = RotatedRect();
+    length = 0;
+    center = Point2f();
+    angle = 0;
+}
+
+LightBar::LightBar(const RotatedRect &lightRect){
+    this->LightRect = lightRect;
+    length = MAX(lightRect.size.height, lightRect.size.width);
+    center = lightRect.center;
+    if (lightRect.angle > 90)
+        angle = lightRect.angle - 180;
+    else
+        angle = lightRect.angle;
+}
+
+void drawRotatedRect(Mat &src, const RotatedRect &rect)
+{
+    // Get the four vertices of the rotated rectangle
+    Point2f vertices[4];
+    rect.points(vertices);
+
+    // Draw the rotated rectangle
+    for (int i = 0; i < 4; i++)
+    {
+        line(src, vertices[i], vertices[(i + 1) % 4], Scalar(255, 0, 255), 2);
+    }
+}
+
+class ArmorBox
+{
+public:
+    ArmorBox();
+/**
+ *@brief: Parametrical constructor of armorBox 装甲板有参构造函数
+ *@param: two LightBar  左右两个灯条
+ */
+    ArmorBox(const LightBar& l_light, const LightBar& r_light);
+    ~ArmorBox();
+
+    // angle difference: the angle difference of left and right lights 装甲板左右灯条角度差
+    float getAngleDiff() const;
+
+    // deviation angle : the horizon angle of the line of centers of lights 灯条错位度角(两灯条中心连线与水平线夹角)
+    float getDeviationAngle() const;
+
+    // dislocation judge X: r-l light center distance ration on the X-axis 灯条位置差距 两灯条中心x方向差距比值
+    float getDislocationX() const;
+
+    // dislocation judge Y:  r-l light center distance ration on the Y-axis 灯条位置差距 两灯条中心Y方向差距比值
+    float getDislocationY() const;
+
+    // length difference ration: the length difference ration r-l lights 左右灯条长度差比值
+    float getLengthRation() const;
+
+    // an integrative function to judge whether this armor is suitable or not
+    bool isSuitableArmor() const;
+
+public:
+    LightBar l_light, r_light; //the left and right lightbar of this armor 装甲板的左右灯条
+    int l_index, r_index; //the index of left and right light 左右灯条的下标(默认为-1，仅作为ArmorDetector类成员时生效)
+    int armorNum;  //number on armor(recognized by SVM) 装甲板上的数字（用SVM识别得到）
+    vector<Point2f> armorVertices;// bl->tl->tr->br     左下 左上 右上 右下
+    ArmorType type; //the type of armor
+    Point2f center;	// center point(crossPoint) of armor 装甲板中心
+    Rect armorRect;  //armorRect for roi 装甲板的矩形获取roi用
+    float armorAngle;//armor angle(mean of lightBars) 装甲板角度(灯条角度的平均值)
+    Mat armorImg;	//image of armor set by getArmorImg() from ArmorNumClassifier() 装甲板的图片（透射变换获得）
+};
+
+void setArmorVertices(const LightBar & l_light, const LightBar & r_light, ArmorBox & armor) {
+    //handle two lights
+    armor.armorVertices.resize(4);
+    cv::Size exLSize(int(l_light.LightRect.size.width), int(l_light.LightRect.size.height * 2));
+    cv::Size exRSize(int(r_light.LightRect.size.width), int(r_light.LightRect.size.height * 2));
+    cv::RotatedRect exLLight(l_light.LightRect.center, exLSize, armor.armorAngle);
+    cv::RotatedRect exRLight(r_light.LightRect.center, exRSize, armor.armorAngle);
+
+    cv::Point2f pts_l[4];
+    exLLight.points(pts_l);
+    cv::Point2f upper_l = pts_l[2];
+    cv::Point2f lower_l = pts_l[3];
+
+    cv::Point2f pts_r[4];
+    exRLight.points(pts_r);
+    cv::Point2f upper_r = pts_r[1];
+    cv::Point2f lower_r = pts_r[0];
+
+    armor.armorVertices[0] = upper_l;
+    armor.armorVertices[1] = upper_r;
+    armor.armorVertices[2] = lower_r;
+    armor.armorVertices[3] = lower_l;
+}
+
+ArmorBox::ArmorBox() {
+    l_index = -1;
+    r_index = -1;
+    l_light = LightBar();
+    r_light = LightBar();
+    armorNum = 0;
+    armorVertices.resize(4);
+    type = SMALL_ARMOR;
+    center = Point2f();
+    armorRect = Rect();
+    armorImg = Mat();
+}
+
+ArmorBox::ArmorBox(const LightBar & l_light, const LightBar & r_light) {
+    this->l_light = l_light;
+    this->r_light = r_light;
+
+    armorNum = 0;
+    armorAngle = (l_light.angle + r_light.angle) / 2;
+
+    //set armorVertices bl->tl->tr->br     左下 左上 右上 右下
+    armorVertices.resize(4);
+    setArmorVertices(l_light, r_light, *this);    // '*this' means the reference of this ArmorBox
+
+    //set armor center
+    center = crossPointof(armorVertices[0], armorVertices[1], armorVertices[2], armorVertices[3]);
+
+    //set armorRect using boundingRect for convenience
+    armorRect = boundingRect(armorVertices);
+
+    //set armor type according to its x ration
+    if (this->getDislocationX() > 2.5)
+        type = BIG_ARMOR;
+}
+
+ArmorBox::~ArmorBox() {}
+
+// angle difference: the angle difference of left and right lights 装甲板左右灯条角度差
+float ArmorBox::getAngleDiff() const {
+    float angle_diff = abs(l_light.angle - r_light.angle); //get the abs of angle_diff 灯条的角度差
+    return angle_diff;
+}
+
+// deviation angle : the horizon angle of the line of centers of lights 灯条错位度角(两灯条中心连线与水平线夹角)
+float ArmorBox::getDeviationAngle() const {
+    float delta_x = r_light.center.x - l_light.center.x; //Δx
+    float delta_y = r_light.center.y - l_light.center.y; //Δy
+    float deviationAngle = abs(atan(delta_y / delta_x)) * 180 / CV_PI; //tanθ=Δy/Δx
+    return deviationAngle;
+}
+
+// dislocation judge X: r-l light center distance ration on the X-axis 灯条位置差距 两灯条中心x方向差距比值
+float ArmorBox::getDislocationX() const {
+    float meanLen = (l_light.length + r_light.length) / 2;
+    float xDiff = abs(l_light.center.x - r_light.center.x); //x distance ration y轴方向上的距离比值（y轴距离与灯条平均值的比）
+    float xDiff_ratio = xDiff / meanLen;
+    return xDiff_ratio;
+}
+
+// dislocation judge Y:  r-l light center distance ration on the Y-axis 灯条位置差距 两灯条中心Y方向差距比值
+float ArmorBox::getDislocationY() const {
+    float meanLen = (l_light.length + r_light.length) / 2;
+    float yDiff = abs(l_light.center.y - r_light.center.y);  //y distance ration x轴方向上的距离比值（x轴距离与灯条平均值的比）
+    float yDiff_ratio = yDiff / meanLen;
+    return yDiff_ratio;
+}
+
+// length difference ration: the length difference ration r-l lights 左右灯条长度差比值
+float ArmorBox::getLengthRation() const {
+    float length_diff = abs(l_light.length - r_light.length);
+    float lengthDiffRation = length_diff / MAX(l_light.length, r_light.length);
+    return lengthDiffRation;
+}
+
+// judge whether this armor is suitable or not  判断本装甲板是否是合适的装甲板
+bool ArmorBox::isSuitableArmor() const
+{
+    return
+        this->getAngleDiff()	  < armorParam.max_angle_diff	    &&		// angle difference judge the angleDiff should be less than max_angle_diff 灯条角度差判断，需小于允许的最大角差
+        this->getDeviationAngle() < armorParam.max_deviation_angle  &&		// deviation angle judge: the horizon angle of the line of centers of lights 灯条错位度角(两灯条中心连线与水平线夹角)判断
+        this->getDislocationX()	  < armorParam.max_x_diff_ratio     &&		// dislocation judge: the x and y can not be too far 灯条位置差距 两灯条中心x、y方向差距不可偏大（用比值作为衡量依据）
+        this->getDislocationY()	  < armorParam.max_y_diff_ratio     &&		// dislocation judge: the x and y can not be too far 灯条位置差距 两灯条中心x、y方向差距不可偏大（用比值作为衡量依据）
+        this->getLengthRation()   < armorParam.max_lengthDiff_ratio;
+}
+
+Size armorImgSize = Size(40, 40);
+void getArmorImg(ArmorBox & armor,Mat & img){
+    //set the armor vertex as srcPoints
+    Point2f srcPoints[4];
+    Point2f dstPoints[4];
+    dstPoints[0] = Point2f(0, 0);
+    dstPoints[1] = Point2f(armorImgSize.width, 0);
+    dstPoints[2] = Point2f(armorImgSize.width, armorImgSize.height);
+    dstPoints[3] = Point2f(0, armorImgSize.height);
+    for (int i = 0; i < 4; i++)
+        srcPoints[i] = armor.armorVertices[i];
+
+    //get the armor image using warpPerspective
+    Mat warpPerspective_mat = getPerspectiveTransform(srcPoints, dstPoints);  // get perspective transform matrix  透射变换矩阵
+    Mat warpPerspective_dst;
+    warpPerspective(img, warpPerspective_dst, warpPerspective_mat, armorImgSize, INTER_NEAREST, BORDER_CONSTANT, Scalar(0)); //warpPerspective to get armorImage
+    warpPerspective_dst.copyTo(armor.armorImg); //copyto armorImg
+}
+
+Ptr<SVM> svm = StatModel::load<SVM>("/home/yshengj/qtProjects/rm_ysj/123svm.xml");
+vector<Point2f> dstPoints(4);
+
+void loadSvmModel(ArmorBox & armor) {
+    //Ptr<SVM>svm = StatModel::load<SVM>("/home/yshengj/qtProjects/rm_ysj/123svm.xml");
+    //if(svm.empty())
+    //{
+        //cout<<"Svm load error! Please check the path!"<<endl;
+       // exit(0);
+   // }
+    //this->armorImgSize = armorImgSize;
+    vector<Point2f> dstPoints(4);
+    //set dstPoints (the same to armorImgSize, as it can avoid resize armorImg)
+    dstPoints[0] = Point2f(0, 0);
+    dstPoints[1] = Point2f(armorImgSize.width,0);
+    dstPoints[2] = Point2f(armorImgSize.width, armorImgSize.height);
+    dstPoints[3] = Point2f(0, armorImgSize.height);
+    Mat img;
+    //armor.armorImg.copyTo(img);
+    cvtColor(armor.armorImg, img, 6);  //CV_BGR2GRAY=6
+    threshold(img, img , 10, 255, THRESH_BINARY);
+    img = img.reshape(1, 1);
+    img.convertTo(img, CV_32FC1);
+    Mat output;
+    svm->predict(img, output);
+    double minVal, maxVal;
+    Point minLoc, maxLoc;
+    minMaxLoc(output, &minVal, &maxVal, &minLoc, &maxLoc); // 获取 output 中的最小值，最大值，最小值位置，最大值位置
+    int maxIndex = maxLoc.x; // 获取最大值对应的类别索引
+    double maxProb = maxVal; // 获取最大值对应的置信度
+
+    armor.armorNum = maxIndex + 1;
+}
+
+int main()
+{
+    Mat src = imread("/home/yshengj/qtProjects/GXURM_ysj/9.jpg");
+    const char* window_image = "Source image";
+    namedWindow(window_image);
+    namedWindow(window_image);
+    imshow(window_image,src);
+    waitKey(0);
+
+    Mat img;
+    cvtColor(src,img,COLOR_BGR2GRAY);
+    imshow(window_image,img);
+    waitKey(0);
+
+    Mat img_binary;
+    threshold(img,img_binary,225,255,THRESH_BINARY);
+    imshow(window_image,img_binary);
+    waitKey(0);
+
+    vector<vector<Point>> lightContours;
+    findContours(img_binary,lightContours,0,2);
+
+
+    RotatedRect lightRect;  //RotatedRect for fitEllipse 拟合椭圆来的灯条旋转矩形
+    LightBar light;  //template light 临时灯条
+
+    vector<LightBar> lights;
+
+    ArmorParam armorParam;
+        for (const auto& lightContour : lightContours) {
+            if (lightContour.size() < 6) continue; //if contour's size is less than 6 , then it can not used to fitEllipse 轮廓点数小于6，不可拟合椭圆
+            if (contourArea(lightContour) < armorParam.min_area) continue; //minarea of lightContour to filter some small blobs 面积筛选滤去小发光点
+
+
+               lightRect = fitEllipse(lightContour); //lightContour fits into a RotatedRect 拟合椭圆
+                light = LightBar(lightRect);//construct to a lightBar 构造为灯条
+
+                if (abs(light.LightRect.angle) > armorParam.max_angle) continue; //angle filter 角度筛选，滤去一些竖直偏角偏大的
+
+                lights.emplace_back(light);
+            }
+        if (lights.size() < 2) {
+            //state = LIGHTS_NOT_FOUND; //if lights is less than 2, then set state not found lights 灯条少于两条则设置状态为没找到灯条
+            return 0; //exit
+        }
+        // sort the lightBars from left to right 将灯条从左到右排序
+
+    sort(lights.begin(), lights.end(),
+     [](LightBar & a1, LightBar & a2) {
+        return a1.LightRect.center.x < a2.LightRect.center.x; });
+    //state = LIGHTS_FOUND;
+    Scalar color = Scalar(0,0,255);
+    Mat src_c;
+    src.copyTo(src_c);
+    drawContours(src_c,lightContours,-1,color,1,LINE_4);
+    imshow(window_image,src_c);
+    waitKey(0);
+
+    Mat src_e;
+    src.copyTo(src_e);
+    for(auto light:lights) {
+        drawRotatedRect(src_e,light.LightRect);
+    }
+    imshow(window_image,src_e);
+    waitKey(0);
+
+    vector<ArmorBox> armors;
+    for(int i = 0; i< lights.size() - 1;i++) {
+        for(int j = i + 1;j < lights.size();j++) {
+            ArmorBox tem_armor(lights[i],lights[j]);
+            if (tem_armor.isSuitableArmor()) {
+                tem_armor.l_index = i; //set index of left light 左灯条的下标
+                tem_armor.r_index = j; //set index of right light 右灯条的下标
+                getArmorImg(tem_armor,src);// set armor image 装甲板的二值图
+                //classifier.setArmorNum(armor);//set armor number 装甲板数字
+                setArmorVertices(lights[i],lights[j],tem_armor);
+                tem_armor.center = crossPointof(tem_armor.armorVertices[0],tem_armor.armorVertices[1],tem_armor.armorVertices[2],tem_armor.armorVertices[3]);
+                armors.emplace_back(tem_armor); //push into armors 将匹配好的装甲板push入armors中
+            }
+        }
+    }
+
+
+    Mat src_armor;
+    src.copyTo(src_armor);
+    /*for(int i = 0;i < armors.size();i++) {
+        ArmorBox armor = armors[i];
+        circle(src_armor,armor.center,2,color);
+        line(src_armor,armor.armorVertices[0],armor.armorVertices[1],color);
+        line(src_armor,armor.armorVertices[1],armor.armorVertices[2],color);
+        line(src_armor,armor.armorVertices[2],armor.armorVertices[3],color);
+        line(src_armor,armor.armorVertices[3],armor.armorVertices[0],color);
+        imshow(window_image,src_armor);
+        waitKey(0);
+
+    } */
+
+    //printf("%d",armors.size());
+
+
+    for (auto armor0:armors) {
+    //ArmorBox armor(lights[0],lights[1]);
+
+    //setArmorVertices(lights[0],lights[1],armor);
+
+
+    //RotatedRect armor_rotatedRect(armor.armorVertices[1], armor.armorVertices[2]);
+    //RotatedRect armor_rotatedrect(armor.center, armor., float angle);
+    //drawRotatedRect(src_armor, armor_rotatedRect);
+
+    drawRotatedRect(src_armor,lights[armor0.l_index].LightRect);
+    drawRotatedRect(src_armor,lights[armor0.r_index].LightRect);
+    imshow(window_image,armor0.armorImg);
+    waitKey(0);
+
+    line(src_armor,armor0.armorVertices[0],armor0.armorVertices[1],color);
+    line(src_armor,armor0.armorVertices[1],armor0.armorVertices[2],color);
+    line(src_armor,armor0.armorVertices[2],armor0.armorVertices[3],color);
+    line(src_armor,armor0.armorVertices[3],armor0.armorVertices[0],color);
+    //imshow(window_image,src_armor);
+    //waitKey(0);
+
+    Scalar color_green = Scalar(0,255,0);
+
+    circle(src_armor, armor0.center, 2, color_green, 2);
+    circle(src_armor, armor0.armorVertices[0], 2, color_green, 2);
+    circle(src_armor, armor0.armorVertices[1], 2, color_green, 2);
+    circle(src_armor, armor0.armorVertices[2], 2, color_green, 2);
+    circle(src_armor, armor0.armorVertices[3], 2, color_green, 2);
+    //imshow(window_image,src_armor);
+    //waitKey(0);
+
+    //imshow(window_image,armor.armorImg);
+    //waitKey(0);
+
+    //printf("%d %d",armor.armorImg.cols,armor.armorImg.rows);
+    loadSvmModel(armor0);
+    //printf("%d",armor.armorNum);
+    putText(src_armor,to_string(armor0.armorNum + 1),armor0.center,0,3,color);
+    }
+    imshow(window_image,src_armor);
+    waitKey(0);
+    return 0;
+
+
+}
+
